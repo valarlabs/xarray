@@ -186,7 +186,7 @@ def encode_cf_variable(
         var = coder.encode(var, name=name)
 
     # TODO(kmuehlbauer): check if ensure_dtype_not_object can be moved to backends:
-    var = ensure_dtype_not_object(var, name=name)
+    # var = ensure_dtype_not_object(var, name=name)
 
     for attr_name in CF_RELATED_DATA:
         pop_to(var.encoding, var.attrs, attr_name)
