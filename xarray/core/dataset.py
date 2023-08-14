@@ -50,7 +50,12 @@ from xarray.core.common import (
     get_chunksizes,
 )
 from xarray.core.computation import unify_chunks
-from xarray.core.coordinates import DatasetCoordinates, assert_coordinate_consistent
+from xarray.core.coordinates import (
+    Coordinates,
+    DatasetCoordinates,
+    assert_coordinate_consistent,
+    create_coords_with_default_indexes,
+)
 from xarray.core.daskmanager import DaskManager
 from xarray.core.duck_array_ops import datetime_to_numeric
 from xarray.core.indexes import (
@@ -70,7 +75,7 @@ from xarray.core.merge import (
     dataset_merge_method,
     dataset_update_method,
     merge_coordinates_without_align,
-    merge_data_and_coords,
+    merge_core,
 )
 from xarray.core.missing import get_clean_interp_index
 from xarray.core.options import OPTIONS, _get_keep_attrs
@@ -113,7 +118,6 @@ if TYPE_CHECKING:
 
     from xarray.backends import AbstractDataStore, ZarrStore
     from xarray.backends.api import T_NetcdfEngine, T_NetcdfTypes
-    from xarray.core.coordinates import Coordinates
     from xarray.core.dataarray import DataArray
     from xarray.core.groupby import DatasetGroupBy
     from xarray.core.merge import CoercibleMapping
@@ -400,6 +404,26 @@ def _initialize_curvefit_params(params, p0, bounds, func_args):
     return param_defaults, bounds_defaults
 
 
+def merge_data_and_coords(data_vars, coords):
+    """Used in Dataset.__init__."""
+    if isinstance(coords, Coordinates):
+        coords = coords.copy()
+    else:
+        coords = create_coords_with_default_indexes(coords, data_vars)
+
+    # exclude coords from alignment (all variables in a Coordinates object should
+    # already be aligned together) and use coordinates' indexes to align data_vars
+    return merge_core(
+        [data_vars, coords],
+        compat="broadcast_equals",
+        join="outer",
+        explicit_coords=tuple(coords),
+        indexes=coords.xindexes,
+        priority_arg=1,
+        skip_align_args=[1],
+    )
+
+
 class DataVariables(Mapping[Any, "DataArray"]):
     __slots__ = ("_dataset",)
 
@@ -491,8 +515,11 @@ class Dataset(
     Dataset implements the mapping interface with keys given by variable
     names and values given by DataArray objects for each variable name.
 
-    One dimensional variables with name equal to their dimension are
-    index coordinates used for label based indexing.
+    By default, pandas indexes are created for one dimensional variables with
+    name equal to their dimension (i.e., :term:`Dimension coordinate`) so those
+    variables can be readily used as coordinates for label based indexing. When a
+    :py:class:`~xarray.Coordinates` object is passed to ``coords``, any existing
+    index(es) built from those coordinates will be added to the Dataset.
 
     To load data from a file or file-like object, use the `open_dataset`
     function.
@@ -513,22 +540,21 @@ class Dataset(
         - mapping {var name: (dimension name, array-like)}
         - mapping {var name: (tuple of dimension names, array-like)}
         - mapping {dimension name: array-like}
-          (it will be automatically moved to coords, see below)
+          (if array-like is not a scalar it will be automatically moved to coords,
+          see below)
 
         Each dimension must have the same length in all variables in
         which it appears.
-    coords : dict-like, optional
-        Another mapping in similar form as the `data_vars` argument,
-        except the each item is saved on the dataset as a "coordinate".
+    coords : :py:class:`~xarray.Coordinates` or dict-like, optional
+        A :py:class:`~xarray.Coordinates` object or another mapping in
+        similar form as the `data_vars` argument, except that each item
+        is saved on the dataset as a "coordinate".
         These variables have an associated meaning: they describe
         constant/fixed/independent quantities, unlike the
         varying/measured/dependent quantities that belong in
-        `variables`. Coordinates values may be given by 1-dimensional
-        arrays or scalars, in which case `dims` do not need to be
-        supplied: 1D arrays will be assumed to give index values along
-        the dimension with the same name.
+        `variables`.
 
-        The following notations are accepted:
+        The following notations are accepted for arbitrary mappings:
 
         - mapping {coord name: DataArray}
         - mapping {coord name: Variable}
@@ -538,8 +564,16 @@ class Dataset(
           (the dimension name is implicitly set to be the same as the
           coord name)
 
-        The last notation implies that the coord name is the same as
-        the dimension name.
+        The last notation implies either that the coordinate value is a scalar
+        or that it is a 1-dimensional array and the coord name is the same as
+        the dimension name (i.e., a :term:`Dimension coordinate`). In the latter
+        case, the 1-dimensional array will be assumed to give index values
+        along the dimension with the same name.
+
+        Alternatively, a :py:class:`~xarray.Coordinates` object may be used in
+        order to explicitly pass indexes (e.g., a multi-index or any custom
+        Xarray index) or to bypass the creation of a default index for any
+        :term:`Dimension coordinate` included in that object.
 
     attrs : dict-like, optional
         Global attributes to save on this dataset.
@@ -602,6 +636,7 @@ class Dataset(
         precipitation   float64 8.326
     Attributes:
         description:  Weather related data.
+
     """
 
     _attrs: dict[Hashable, Any] | None
@@ -633,8 +668,6 @@ class Dataset(
         coords: Mapping[Any, Any] | None = None,
         attrs: Mapping[Any, Any] | None = None,
     ) -> None:
-        # TODO(shoyer): expose indexes as a public argument in __init__
-
         if data_vars is None:
             data_vars = {}
         if coords is None:
@@ -650,7 +683,7 @@ class Dataset(
             coords = coords._variables
 
         variables, coord_names, dims, indexes, _ = merge_data_and_coords(
-            data_vars, coords, compat="broadcast_equals"
+            data_vars, coords
         )
 
         self._attrs = dict(attrs) if attrs is not None else None
@@ -1657,10 +1690,59 @@ class Dataset(
         the other dataset can still be broadcast equal if the the non-scalar
         variable is a constant.
 
+        Examples
+        --------
+
+        # 2D array with shape (1, 3)
+
+        >>> data = np.array([[1, 2, 3]])
+        >>> a = xr.Dataset(
+        ...     {"variable_name": (("space", "time"), data)},
+        ...     coords={"space": [0], "time": [0, 1, 2]},
+        ... )
+        >>> a
+        <xarray.Dataset>
+        Dimensions:        (space: 1, time: 3)
+        Coordinates:
+          * space          (space) int64 0
+          * time           (time) int64 0 1 2
+        Data variables:
+            variable_name  (space, time) int64 1 2 3
+
+        # 2D array with shape (3, 1)
+
+        >>> data = np.array([[1], [2], [3]])
+        >>> b = xr.Dataset(
+        ...     {"variable_name": (("time", "space"), data)},
+        ...     coords={"time": [0, 1, 2], "space": [0]},
+        ... )
+        >>> b
+        <xarray.Dataset>
+        Dimensions:        (time: 3, space: 1)
+        Coordinates:
+          * time           (time) int64 0 1 2
+          * space          (space) int64 0
+        Data variables:
+            variable_name  (time, space) int64 1 2 3
+
+        .equals returns True if two Datasets have the same values, dimensions, and coordinates. .broadcast_equals returns True if the
+        results of broadcasting two Datasets against each other have the same values, dimensions, and coordinates.
+
+        >>> a.equals(b)
+        False
+
+        >>> a.broadcast_equals(b)
+        True
+
+        >>> a2, b2 = xr.broadcast(a, b)
+        >>> a2.equals(b2)
+        True
+
         See Also
         --------
         Dataset.equals
         Dataset.identical
+        Dataset.broadcast
         """
         try:
             return self._all_compat(other, "broadcast_equals")
@@ -1677,6 +1759,67 @@ class Dataset(
         This method is necessary because `v1 == v2` for ``Dataset``
         does element-wise comparisons (like numpy.ndarrays).
 
+        Examples
+        --------
+
+        # 2D array with shape (1, 3)
+
+        >>> data = np.array([[1, 2, 3]])
+        >>> dataset1 = xr.Dataset(
+        ...     {"variable_name": (("space", "time"), data)},
+        ...     coords={"space": [0], "time": [0, 1, 2]},
+        ... )
+        >>> dataset1
+        <xarray.Dataset>
+        Dimensions:        (space: 1, time: 3)
+        Coordinates:
+          * space          (space) int64 0
+          * time           (time) int64 0 1 2
+        Data variables:
+            variable_name  (space, time) int64 1 2 3
+
+        # 2D array with shape (3, 1)
+
+        >>> data = np.array([[1], [2], [3]])
+        >>> dataset2 = xr.Dataset(
+        ...     {"variable_name": (("time", "space"), data)},
+        ...     coords={"time": [0, 1, 2], "space": [0]},
+        ... )
+        >>> dataset2
+        <xarray.Dataset>
+        Dimensions:        (time: 3, space: 1)
+        Coordinates:
+          * time           (time) int64 0 1 2
+          * space          (space) int64 0
+        Data variables:
+            variable_name  (time, space) int64 1 2 3
+        >>> dataset1.equals(dataset2)
+        False
+
+        >>> dataset1.broadcast_equals(dataset2)
+        True
+
+        .equals returns True if two Datasets have the same values, dimensions, and coordinates. .broadcast_equals returns True if the
+        results of broadcasting two Datasets against each other have the same values, dimensions, and coordinates.
+
+        Similar for missing values too:
+
+        >>> ds1 = xr.Dataset(
+        ...     {
+        ...         "temperature": (["x", "y"], [[1, np.nan], [3, 4]]),
+        ...     },
+        ...     coords={"x": [0, 1], "y": [0, 1]},
+        ... )
+
+        >>> ds2 = xr.Dataset(
+        ...     {
+        ...         "temperature": (["x", "y"], [[1, np.nan], [3, 4]]),
+        ...     },
+        ...     coords={"x": [0, 1], "y": [0, 1]},
+        ... )
+        >>> ds1.equals(ds2)
+        True
+
         See Also
         --------
         Dataset.broadcast_equals
@@ -1690,6 +1833,66 @@ class Dataset(
     def identical(self, other: Dataset) -> bool:
         """Like equals, but also checks all dataset attributes and the
         attributes on all variables and coordinates.
+
+        Example
+        -------
+
+        >>> a = xr.Dataset(
+        ...     {"Width": ("X", [1, 2, 3])},
+        ...     coords={"X": [1, 2, 3]},
+        ...     attrs={"units": "m"},
+        ... )
+        >>> b = xr.Dataset(
+        ...     {"Width": ("X", [1, 2, 3])},
+        ...     coords={"X": [1, 2, 3]},
+        ...     attrs={"units": "m"},
+        ... )
+        >>> c = xr.Dataset(
+        ...     {"Width": ("X", [1, 2, 3])},
+        ...     coords={"X": [1, 2, 3]},
+        ...     attrs={"units": "ft"},
+        ... )
+        >>> a
+        <xarray.Dataset>
+        Dimensions:  (X: 3)
+        Coordinates:
+          * X        (X) int64 1 2 3
+        Data variables:
+            Width    (X) int64 1 2 3
+        Attributes:
+            units:    m
+
+        >>> b
+        <xarray.Dataset>
+        Dimensions:  (X: 3)
+        Coordinates:
+          * X        (X) int64 1 2 3
+        Data variables:
+            Width    (X) int64 1 2 3
+        Attributes:
+            units:    m
+
+        >>> c
+        <xarray.Dataset>
+        Dimensions:  (X: 3)
+        Coordinates:
+          * X        (X) int64 1 2 3
+        Data variables:
+            Width    (X) int64 1 2 3
+        Attributes:
+            units:    ft
+
+        >>> a.equals(b)
+        True
+
+        >>> a.identical(b)
+        True
+
+        >>> a.equals(c)
+        True
+
+        >>> a.identical(c)
+        False
 
         See Also
         --------
@@ -1719,13 +1922,19 @@ class Dataset(
 
     @property
     def xindexes(self) -> Indexes[Index]:
-        """Mapping of xarray Index objects used for label based indexing."""
+        """Mapping of :py:class:`~xarray.indexes.Index` objects
+        used for label based indexing.
+        """
         return Indexes(self._indexes, {k: self._variables[k] for k in self._indexes})
 
     @property
     def coords(self) -> DatasetCoordinates:
-        """Dictionary of xarray.DataArray objects corresponding to coordinate
-        variables
+        """Mapping of :py:class:`~xarray.DataArray` objects corresponding to
+        coordinate variables.
+
+        See Also
+        --------
+        Coordinates
         """
         return DatasetCoordinates(self)
 
@@ -1741,6 +1950,33 @@ class Dataset(
         ----------
         names : hashable or iterable of hashable
             Name(s) of variables in this dataset to convert into coordinates.
+
+        Examples
+        --------
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "pressure": ("time", [1.013, 1.2, 3.5]),
+        ...         "time": pd.date_range("2023-01-01", periods=3),
+        ...     }
+        ... )
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:   (time: 3)
+        Coordinates:
+          * time      (time) datetime64[ns] 2023-01-01 2023-01-02 2023-01-03
+        Data variables:
+            pressure  (time) float64 1.013 1.2 3.5
+
+        >>> dataset.set_coords("pressure")
+        <xarray.Dataset>
+        Dimensions:   (time: 3)
+        Coordinates:
+            pressure  (time) float64 1.013 1.2 3.5
+          * time      (time) datetime64[ns] 2023-01-01 2023-01-02 2023-01-03
+        Data variables:
+            *empty*
+
+        On calling ``set_coords`` , these data variables are converted to coordinates, as shown in the final dataset.
 
         Returns
         -------
@@ -1780,9 +2016,66 @@ class Dataset(
             If True, remove coordinates instead of converting them into
             variables.
 
+        Examples
+        --------
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "temperature": (
+        ...             ["time", "lat", "lon"],
+        ...             [[[25, 26], [27, 28]], [[29, 30], [31, 32]]],
+        ...         ),
+        ...         "precipitation": (
+        ...             ["time", "lat", "lon"],
+        ...             [[[0.5, 0.8], [0.2, 0.4]], [[0.3, 0.6], [0.7, 0.9]]],
+        ...         ),
+        ...     },
+        ...     coords={
+        ...         "time": pd.date_range(start="2023-01-01", periods=2),
+        ...         "lat": [40, 41],
+        ...         "lon": [-80, -79],
+        ...         "altitude": 1000,
+        ...     },
+        ... )
+
+        # Dataset before resetting coordinates
+
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:        (time: 2, lat: 2, lon: 2)
+        Coordinates:
+          * time           (time) datetime64[ns] 2023-01-01 2023-01-02
+          * lat            (lat) int64 40 41
+          * lon            (lon) int64 -80 -79
+            altitude       int64 1000
+        Data variables:
+            temperature    (time, lat, lon) int64 25 26 27 28 29 30 31 32
+            precipitation  (time, lat, lon) float64 0.5 0.8 0.2 0.4 0.3 0.6 0.7 0.9
+
+        # Reset the 'altitude' coordinate
+
+        >>> dataset_reset = dataset.reset_coords("altitude")
+
+        # Dataset after resetting coordinates
+
+        >>> dataset_reset
+        <xarray.Dataset>
+        Dimensions:        (time: 2, lat: 2, lon: 2)
+        Coordinates:
+          * time           (time) datetime64[ns] 2023-01-01 2023-01-02
+          * lat            (lat) int64 40 41
+          * lon            (lon) int64 -80 -79
+        Data variables:
+            temperature    (time, lat, lon) int64 25 26 27 28 29 30 31 32
+            precipitation  (time, lat, lon) float64 0.5 0.8 0.2 0.4 0.3 0.6 0.7 0.9
+            altitude       int64 1000
+
         Returns
         -------
         Dataset
+
+        See Also
+        --------
+        Dataset.set_coords
         """
         if names is None:
             names = self._coord_names - set(self._indexes)
@@ -1919,7 +2212,9 @@ class Dataset(
             Nested dictionary with variable names as keys and dictionaries of
             variable specific encodings as values, e.g.,
             ``{"my_variable": {"dtype": "int16", "scale_factor": 0.1,
-            "zlib": True}, ...}``
+            "zlib": True}, ...}``.
+            If ``encoding`` is specified the original encoding of the variables of
+            the dataset is ignored.
 
             The `h5netcdf` engine supports both the NetCDF4-style compression
             encoding parameters ``{"zlib": True, "complevel": 9}`` and the h5py
@@ -1985,6 +2280,7 @@ class Dataset(
         safe_chunks: bool = True,
         storage_options: dict[str, str] | None = None,
         zarr_version: int | None = None,
+        write_empty_chunks: bool | None = None,
         chunkmanager_store_kwargs: dict[str, Any] | None = None,
     ) -> ZarrStore:
         ...
@@ -2007,6 +2303,7 @@ class Dataset(
         safe_chunks: bool = True,
         storage_options: dict[str, str] | None = None,
         zarr_version: int | None = None,
+        write_empty_chunks: bool | None = None,
         chunkmanager_store_kwargs: dict[str, Any] | None = None,
     ) -> Delayed:
         ...
@@ -2026,6 +2323,7 @@ class Dataset(
         safe_chunks: bool = True,
         storage_options: dict[str, str] | None = None,
         zarr_version: int | None = None,
+        write_empty_chunks: bool | None = None,
         chunkmanager_store_kwargs: dict[str, Any] | None = None,
     ) -> ZarrStore | Delayed:
         """Write dataset contents to a zarr group.
@@ -2115,6 +2413,17 @@ class Dataset(
             The desired zarr spec version to target (currently 2 or 3). The
             default of None will attempt to determine the zarr version from
             ``store`` when possible, otherwise defaulting to 2.
+        write_empty_chunks : bool or None, optional
+            If True, all chunks will be stored regardless of their
+            contents. If False, each chunk is compared to the array's fill value
+            prior to storing. If a chunk is uniformly equal to the fill value, then
+            that chunk is not be stored, and the store entry for that chunk's key
+            is deleted. This setting enables sparser storage, as only chunks with
+            non-fill-value data are stored, at the expense of overhead associated
+            with checking the data of each chunk. If None (default) fall back to
+            specification(s) in ``encoding`` or Zarr defaults. A ``ValueError``
+            will be raised if the value of this (if not None) differs with
+            ``encoding``.
         chunkmanager_store_kwargs : dict, optional
             Additional keyword arguments passed on to the `ChunkManager.store` method used to store
             chunked arrays. For example for a dask array additional kwargs will be passed eventually to
@@ -2164,6 +2473,7 @@ class Dataset(
             region=region,
             safe_chunks=safe_chunks,
             zarr_version=zarr_version,
+            write_empty_chunks=write_empty_chunks,
             chunkmanager_store_kwargs=chunkmanager_store_kwargs,
         )
 
@@ -2497,6 +2807,63 @@ class Dataset(
             in this dataset, unless vectorized indexing was triggered by using
             an array indexer, in which case the data will be a copy.
 
+        Examples
+        --------
+
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "math_scores": (
+        ...             ["student", "test"],
+        ...             [[90, 85, 92], [78, 80, 85], [95, 92, 98]],
+        ...         ),
+        ...         "english_scores": (
+        ...             ["student", "test"],
+        ...             [[88, 90, 92], [75, 82, 79], [93, 96, 91]],
+        ...         ),
+        ...     },
+        ...     coords={
+        ...         "student": ["Alice", "Bob", "Charlie"],
+        ...         "test": ["Test 1", "Test 2", "Test 3"],
+        ...     },
+        ... )
+
+        # A specific element from the dataset is selected
+
+        >>> dataset.isel(student=1, test=0)
+        <xarray.Dataset>
+        Dimensions:         ()
+        Coordinates:
+            student         <U7 'Bob'
+            test            <U6 'Test 1'
+        Data variables:
+            math_scores     int64 78
+            english_scores  int64 75
+
+        # Indexing with a slice using isel
+
+        >>> slice_of_data = dataset.isel(student=slice(0, 2), test=slice(0, 2))
+        >>> slice_of_data
+        <xarray.Dataset>
+        Dimensions:         (student: 2, test: 2)
+        Coordinates:
+          * student         (student) <U7 'Alice' 'Bob'
+          * test            (test) <U6 'Test 1' 'Test 2'
+        Data variables:
+            math_scores     (student, test) int64 90 85 78 80
+            english_scores  (student, test) int64 88 90 75 82
+
+        >>> index_array = xr.DataArray([0, 2], dims="student")
+        >>> indexed_data = dataset.isel(student=index_array)
+        >>> indexed_data
+        <xarray.Dataset>
+        Dimensions:         (student: 2, test: 3)
+        Coordinates:
+          * student         (student) <U7 'Alice' 'Charlie'
+          * test            (test) <U6 'Test 1' 'Test 2' 'Test 3'
+        Data variables:
+            math_scores     (student, test) int64 90 85 92 95 92 98
+            english_scores  (student, test) int64 88 90 92 93 96 91
+
         See Also
         --------
         Dataset.sel
@@ -2685,6 +3052,50 @@ class Dataset(
             The keyword arguments form of ``indexers``.
             One of indexers or indexers_kwargs must be provided.
 
+        Examples
+        --------
+        >>> dates = pd.date_range(start="2023-01-01", periods=5)
+        >>> pageviews = [1200, 1500, 900, 1800, 2000]
+        >>> visitors = [800, 1000, 600, 1200, 1500]
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "pageviews": (("date"), pageviews),
+        ...         "visitors": (("date"), visitors),
+        ...     },
+        ...     coords={"date": dates},
+        ... )
+        >>> busiest_days = dataset.sortby("pageviews", ascending=False)
+        >>> busiest_days.head()
+        <xarray.Dataset>
+        Dimensions:    (date: 5)
+        Coordinates:
+          * date       (date) datetime64[ns] 2023-01-05 2023-01-04 ... 2023-01-03
+        Data variables:
+            pageviews  (date) int64 2000 1800 1500 1200 900
+            visitors   (date) int64 1500 1200 1000 800 600
+
+        # Retrieve the 3 most busiest days in terms of pageviews
+
+        >>> busiest_days.head(3)
+        <xarray.Dataset>
+        Dimensions:    (date: 3)
+        Coordinates:
+          * date       (date) datetime64[ns] 2023-01-05 2023-01-04 2023-01-02
+        Data variables:
+            pageviews  (date) int64 2000 1800 1500
+            visitors   (date) int64 1500 1200 1000
+
+        # Using a dictionary to specify the number of elements for specific dimensions
+
+        >>> busiest_days.head({"date": 3})
+        <xarray.Dataset>
+        Dimensions:    (date: 3)
+        Coordinates:
+          * date       (date) datetime64[ns] 2023-01-05 2023-01-04 2023-01-02
+        Data variables:
+            pageviews  (date) int64 2000 1800 1500
+            visitors   (date) int64 1500 1200 1000
+
         See Also
         --------
         Dataset.tail
@@ -2730,6 +3141,48 @@ class Dataset(
         **indexers_kwargs : {dim: n, ...}, optional
             The keyword arguments form of ``indexers``.
             One of indexers or indexers_kwargs must be provided.
+
+        Examples
+        --------
+        >>> activity_names = ["Walking", "Running", "Cycling", "Swimming", "Yoga"]
+        >>> durations = [30, 45, 60, 45, 60]  # in minutes
+        >>> energies = [150, 300, 250, 400, 100]  # in calories
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "duration": (["activity"], durations),
+        ...         "energy_expenditure": (["activity"], energies),
+        ...     },
+        ...     coords={"activity": activity_names},
+        ... )
+        >>> sorted_dataset = dataset.sortby("energy_expenditure", ascending=False)
+        >>> sorted_dataset
+        <xarray.Dataset>
+        Dimensions:             (activity: 5)
+        Coordinates:
+          * activity            (activity) <U8 'Swimming' 'Running' ... 'Walking' 'Yoga'
+        Data variables:
+            duration            (activity) int64 45 45 60 30 60
+            energy_expenditure  (activity) int64 400 300 250 150 100
+
+        # Activities with the least energy expenditures using tail()
+
+        >>> sorted_dataset.tail(3)
+        <xarray.Dataset>
+        Dimensions:             (activity: 3)
+        Coordinates:
+          * activity            (activity) <U8 'Cycling' 'Walking' 'Yoga'
+        Data variables:
+            duration            (activity) int64 60 30 60
+            energy_expenditure  (activity) int64 250 150 100
+
+        >>> sorted_dataset.tail({"activity": 3})
+        <xarray.Dataset>
+        Dimensions:             (activity: 3)
+        Coordinates:
+          * activity            (activity) <U8 'Cycling' 'Walking' 'Yoga'
+        Data variables:
+            duration            (activity) int64 60 30 60
+            energy_expenditure  (activity) int64 250 150 100
 
         See Also
         --------
@@ -2876,7 +3329,7 @@ class Dataset(
         )
 
     def _reindex_callback(
-        self,
+        self: T_Dataset,
         aligner: alignment.Aligner,
         dim_pos_indexers: dict[Hashable, Any],
         variables: dict[Hashable, Variable],
@@ -2884,7 +3337,7 @@ class Dataset(
         fill_value: Any,
         exclude_dims: frozenset[Hashable],
         exclude_vars: frozenset[Hashable],
-    ) -> Dataset:
+    ) -> T_Dataset:
         """Callback called from ``Aligner`` to create a new reindexed Dataset."""
 
         new_variables = variables.copy()
@@ -2931,6 +3384,8 @@ class Dataset(
             reindexed = self._replace_with_new_dims(
                 new_variables, new_coord_names, indexes=new_indexes
             )
+
+        reindexed.encoding = self.encoding
 
         return reindexed
 
@@ -3979,6 +4434,64 @@ class Dataset(
         -------
         expanded : Dataset
             This object, but with additional dimension(s).
+
+        Examples
+        --------
+        >>> dataset = xr.Dataset({"temperature": ([], 25.0)})
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:      ()
+        Data variables:
+            temperature  float64 25.0
+
+        # Expand the dataset with a new dimension called "time"
+
+        >>> dataset.expand_dims(dim="time")
+        <xarray.Dataset>
+        Dimensions:      (time: 1)
+        Dimensions without coordinates: time
+        Data variables:
+            temperature  (time) float64 25.0
+
+        # 1D data
+
+        >>> temperature_1d = xr.DataArray([25.0, 26.5, 24.8], dims="x")
+        >>> dataset_1d = xr.Dataset({"temperature": temperature_1d})
+        >>> dataset_1d
+        <xarray.Dataset>
+        Dimensions:      (x: 3)
+        Dimensions without coordinates: x
+        Data variables:
+            temperature  (x) float64 25.0 26.5 24.8
+
+        # Expand the dataset with a new dimension called "time" using axis argument
+
+        >>> dataset_1d.expand_dims(dim="time", axis=0)
+        <xarray.Dataset>
+        Dimensions:      (time: 1, x: 3)
+        Dimensions without coordinates: time, x
+        Data variables:
+            temperature  (time, x) float64 25.0 26.5 24.8
+
+        # 2D data
+
+        >>> temperature_2d = xr.DataArray(np.random.rand(3, 4), dims=("y", "x"))
+        >>> dataset_2d = xr.Dataset({"temperature": temperature_2d})
+        >>> dataset_2d
+        <xarray.Dataset>
+        Dimensions:      (y: 3, x: 4)
+        Dimensions without coordinates: y, x
+        Data variables:
+            temperature  (y, x) float64 0.5488 0.7152 0.6028 ... 0.3834 0.7917 0.5289
+
+        # Expand the dataset with a new dimension called "time" using axis argument
+
+        >>> dataset_2d.expand_dims(dim="time", axis=2)
+        <xarray.Dataset>
+        Dimensions:      (y: 3, x: 4, time: 1)
+        Dimensions without coordinates: y, x, time
+        Data variables:
+            temperature  (y, x, time) float64 0.5488 0.7152 0.6028 ... 0.7917 0.5289
 
         See Also
         --------
@@ -5154,9 +5667,99 @@ class Dataset(
             passed are not in the dataset. If 'ignore', any given names that are in the
             dataset are dropped and no error is raised.
 
+        Examples
+        --------
+
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "temperature": (
+        ...             ["time", "latitude", "longitude"],
+        ...             [[[25.5, 26.3], [27.1, 28.0]]],
+        ...         ),
+        ...         "humidity": (
+        ...             ["time", "latitude", "longitude"],
+        ...             [[[65.0, 63.8], [58.2, 59.6]]],
+        ...         ),
+        ...         "wind_speed": (
+        ...             ["time", "latitude", "longitude"],
+        ...             [[[10.2, 8.5], [12.1, 9.8]]],
+        ...         ),
+        ...     },
+        ...     coords={
+        ...         "time": pd.date_range("2023-07-01", periods=1),
+        ...         "latitude": [40.0, 40.2],
+        ...         "longitude": [-75.0, -74.8],
+        ...     },
+        ... )
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:      (time: 1, latitude: 2, longitude: 2)
+        Coordinates:
+          * time         (time) datetime64[ns] 2023-07-01
+          * latitude     (latitude) float64 40.0 40.2
+          * longitude    (longitude) float64 -75.0 -74.8
+        Data variables:
+            temperature  (time, latitude, longitude) float64 25.5 26.3 27.1 28.0
+            humidity     (time, latitude, longitude) float64 65.0 63.8 58.2 59.6
+            wind_speed   (time, latitude, longitude) float64 10.2 8.5 12.1 9.8
+
+        # Drop the 'humidity' variable
+
+        >>> dataset.drop_vars(["humidity"])
+        <xarray.Dataset>
+        Dimensions:      (time: 1, latitude: 2, longitude: 2)
+        Coordinates:
+          * time         (time) datetime64[ns] 2023-07-01
+          * latitude     (latitude) float64 40.0 40.2
+          * longitude    (longitude) float64 -75.0 -74.8
+        Data variables:
+            temperature  (time, latitude, longitude) float64 25.5 26.3 27.1 28.0
+            wind_speed   (time, latitude, longitude) float64 10.2 8.5 12.1 9.8
+
+        # Drop the 'humidity', 'temperature' variables
+
+        >>> dataset.drop_vars(["humidity", "temperature"])
+        <xarray.Dataset>
+        Dimensions:     (time: 1, latitude: 2, longitude: 2)
+        Coordinates:
+          * time        (time) datetime64[ns] 2023-07-01
+          * latitude    (latitude) float64 40.0 40.2
+          * longitude   (longitude) float64 -75.0 -74.8
+        Data variables:
+            wind_speed  (time, latitude, longitude) float64 10.2 8.5 12.1 9.8
+
+        # Attempt to drop non-existent variable with errors="ignore"
+
+        >>> dataset.drop_vars(["pressure"], errors="ignore")
+        <xarray.Dataset>
+        Dimensions:      (time: 1, latitude: 2, longitude: 2)
+        Coordinates:
+          * time         (time) datetime64[ns] 2023-07-01
+          * latitude     (latitude) float64 40.0 40.2
+          * longitude    (longitude) float64 -75.0 -74.8
+        Data variables:
+            temperature  (time, latitude, longitude) float64 25.5 26.3 27.1 28.0
+            humidity     (time, latitude, longitude) float64 65.0 63.8 58.2 59.6
+            wind_speed   (time, latitude, longitude) float64 10.2 8.5 12.1 9.8
+
+        # Attempt to drop non-existent variable with errors="raise"
+
+        >>> dataset.drop_vars(["pressure"], errors="raise")
+        Traceback (most recent call last):
+        ValueError: These variables cannot be found in this dataset: ['pressure']
+
+        Raises
+        ------
+        ValueError
+             Raised if you attempt to drop a variable which is not present, and the kwarg ``errors='raise'``.
+
         Returns
         -------
         dropped : Dataset
+
+        See Also
+        --------
+        DataArray.drop_vars
 
         """
         # the Iterable check is required for mypy
@@ -5560,6 +6163,70 @@ class Dataset(
             Which variables to check for missing values. By default, all
             variables in the dataset are checked.
 
+        Examples
+        --------
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "temperature": (
+        ...             ["time", "location"],
+        ...             [[23.4, 24.1], [np.nan, 22.1], [21.8, 24.2], [20.5, 25.3]],
+        ...         )
+        ...     },
+        ...     coords={"time": [1, 2, 3, 4], "location": ["A", "B"]},
+        ... )
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:      (time: 4, location: 2)
+        Coordinates:
+          * time         (time) int64 1 2 3 4
+          * location     (location) <U1 'A' 'B'
+        Data variables:
+            temperature  (time, location) float64 23.4 24.1 nan 22.1 21.8 24.2 20.5 25.3
+
+        # Drop NaN values from the dataset
+
+        >>> dataset.dropna(dim="time")
+        <xarray.Dataset>
+        Dimensions:      (time: 3, location: 2)
+        Coordinates:
+          * time         (time) int64 1 3 4
+          * location     (location) <U1 'A' 'B'
+        Data variables:
+            temperature  (time, location) float64 23.4 24.1 21.8 24.2 20.5 25.3
+
+        # Drop labels with any NAN values
+
+        >>> dataset.dropna(dim="time", how="any")
+        <xarray.Dataset>
+        Dimensions:      (time: 3, location: 2)
+        Coordinates:
+          * time         (time) int64 1 3 4
+          * location     (location) <U1 'A' 'B'
+        Data variables:
+            temperature  (time, location) float64 23.4 24.1 21.8 24.2 20.5 25.3
+
+        # Drop labels with all NAN values
+
+        >>> dataset.dropna(dim="time", how="all")
+        <xarray.Dataset>
+        Dimensions:      (time: 4, location: 2)
+        Coordinates:
+          * time         (time) int64 1 2 3 4
+          * location     (location) <U1 'A' 'B'
+        Data variables:
+            temperature  (time, location) float64 23.4 24.1 nan 22.1 21.8 24.2 20.5 25.3
+
+        # Drop labels with less than 2 non-NA values
+
+        >>> dataset.dropna(dim="time", thresh=2)
+        <xarray.Dataset>
+        Dimensions:      (time: 3, location: 2)
+        Coordinates:
+          * time         (time) int64 1 3 4
+          * location     (location) <U1 'A' 'B'
+        Data variables:
+            temperature  (time, location) float64 23.4 24.1 21.8 24.2 20.5 25.3
+
         Returns
         -------
         Dataset
@@ -5749,6 +6416,11 @@ class Dataset(
         interpolated: Dataset
             Filled in Dataset.
 
+        Warning
+        --------
+        When passing fill_value as a keyword argument with method="linear", it does not use
+        ``numpy.interp`` but it uses ``scipy.interpolate.interp1d``, which provides the fill_value parameter.
+
         See Also
         --------
         numpy.interp
@@ -5820,8 +6492,7 @@ class Dataset(
         Parameters
         ----------
         dim : Hashable
-            Specifies the dimension along which to propagate values when
-            filling.
+            Specifies the dimension along which to propagate values when filling.
         limit : int or None, optional
             The maximum number of consecutive NaN values to forward fill. In
             other words, if there is a gap with more than this number of
@@ -5829,9 +6500,48 @@ class Dataset(
             than 0 or None for no limit. Must be None or greater than or equal
             to axis length if filling along chunked axes (dimensions).
 
+        Examples
+        --------
+        >>> time = pd.date_range("2023-01-01", periods=10, freq="D")
+        >>> data = np.array(
+        ...     [1, np.nan, np.nan, np.nan, 5, np.nan, np.nan, 8, np.nan, 10]
+        ... )
+        >>> dataset = xr.Dataset({"data": (("time",), data)}, coords={"time": time})
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:  (time: 10)
+        Coordinates:
+          * time     (time) datetime64[ns] 2023-01-01 2023-01-02 ... 2023-01-10
+        Data variables:
+            data     (time) float64 1.0 nan nan nan 5.0 nan nan 8.0 nan 10.0
+
+        # Perform forward fill (ffill) on the dataset
+
+        >>> dataset.ffill(dim="time")
+        <xarray.Dataset>
+        Dimensions:  (time: 10)
+        Coordinates:
+          * time     (time) datetime64[ns] 2023-01-01 2023-01-02 ... 2023-01-10
+        Data variables:
+            data     (time) float64 1.0 1.0 1.0 1.0 5.0 5.0 5.0 8.0 8.0 10.0
+
+        # Limit the forward filling to a maximum of 2 consecutive NaN values
+
+        >>> dataset.ffill(dim="time", limit=2)
+        <xarray.Dataset>
+        Dimensions:  (time: 10)
+        Coordinates:
+          * time     (time) datetime64[ns] 2023-01-01 2023-01-02 ... 2023-01-10
+        Data variables:
+            data     (time) float64 1.0 1.0 1.0 nan 5.0 5.0 5.0 8.0 8.0 10.0
+
         Returns
         -------
         Dataset
+
+        See Also
+        --------
+        Dataset.bfill
         """
         from xarray.core.missing import _apply_over_vars_with_dim, ffill
 
@@ -5855,9 +6565,48 @@ class Dataset(
             than 0 or None for no limit. Must be None or greater than or equal
             to axis length if filling along chunked axes (dimensions).
 
+        Examples
+        --------
+        >>> time = pd.date_range("2023-01-01", periods=10, freq="D")
+        >>> data = np.array(
+        ...     [1, np.nan, np.nan, np.nan, 5, np.nan, np.nan, 8, np.nan, 10]
+        ... )
+        >>> dataset = xr.Dataset({"data": (("time",), data)}, coords={"time": time})
+        >>> dataset
+        <xarray.Dataset>
+        Dimensions:  (time: 10)
+        Coordinates:
+          * time     (time) datetime64[ns] 2023-01-01 2023-01-02 ... 2023-01-10
+        Data variables:
+            data     (time) float64 1.0 nan nan nan 5.0 nan nan 8.0 nan 10.0
+
+        # filled dataset, fills NaN values by propagating values backward
+
+        >>> dataset.bfill(dim="time")
+        <xarray.Dataset>
+        Dimensions:  (time: 10)
+        Coordinates:
+          * time     (time) datetime64[ns] 2023-01-01 2023-01-02 ... 2023-01-10
+        Data variables:
+            data     (time) float64 1.0 5.0 5.0 5.0 5.0 8.0 8.0 8.0 10.0 10.0
+
+        # Limit the backward filling to a maximum of 2 consecutive NaN values
+
+        >>> dataset.bfill(dim="time", limit=2)
+        <xarray.Dataset>
+        Dimensions:  (time: 10)
+        Coordinates:
+          * time     (time) datetime64[ns] 2023-01-01 2023-01-02 ... 2023-01-10
+        Data variables:
+            data     (time) float64 1.0 nan 5.0 5.0 5.0 8.0 8.0 8.0 10.0 10.0
+
         Returns
         -------
         Dataset
+
+        See Also
+        --------
+        Dataset.ffill
         """
         from xarray.core.missing import _apply_over_vars_with_dim, bfill
 
@@ -5922,6 +6671,38 @@ class Dataset(
         reduced : Dataset
             Dataset with this object's DataArrays replaced with new DataArrays
             of summarized data and the indicated dimension(s) removed.
+
+        Examples
+        --------
+
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "math_scores": (
+        ...             ["student", "test"],
+        ...             [[90, 85, 92], [78, 80, 85], [95, 92, 98]],
+        ...         ),
+        ...         "english_scores": (
+        ...             ["student", "test"],
+        ...             [[88, 90, 92], [75, 82, 79], [93, 96, 91]],
+        ...         ),
+        ...     },
+        ...     coords={
+        ...         "student": ["Alice", "Bob", "Charlie"],
+        ...         "test": ["Test 1", "Test 2", "Test 3"],
+        ...     },
+        ... )
+
+        # Calculate the 75th percentile of math scores for each student using np.percentile
+
+        >>> percentile_scores = dataset.reduce(np.percentile, q=75, dim="test")
+        >>> percentile_scores
+        <xarray.Dataset>
+        Dimensions:         (student: 3)
+        Coordinates:
+          * student         (student) <U7 'Alice' 'Bob' 'Charlie'
+        Data variables:
+            math_scores     (student) float64 91.0 82.5 96.5
+            english_scores  (student) float64 91.0 80.5 94.5
         """
         if kwargs.get("axis", None) is not None:
             raise ValueError(
@@ -7122,15 +7903,15 @@ class Dataset(
             desired quantile lies between two data points. The options sorted by their R
             type as summarized in the H&F paper [1]_ are:
 
-                1. "inverted_cdf" (*)
-                2. "averaged_inverted_cdf" (*)
-                3. "closest_observation" (*)
-                4. "interpolated_inverted_cdf" (*)
-                5. "hazen" (*)
-                6. "weibull" (*)
+                1. "inverted_cdf"
+                2. "averaged_inverted_cdf"
+                3. "closest_observation"
+                4. "interpolated_inverted_cdf"
+                5. "hazen"
+                6. "weibull"
                 7. "linear"  (default)
-                8. "median_unbiased" (*)
-                9. "normal_unbiased" (*)
+                8. "median_unbiased"
+                9. "normal_unbiased"
 
             The first three methods are discontiuous.  The following discontinuous
             variations of the default "linear" (7.) option are also available:
@@ -7143,8 +7924,6 @@ class Dataset(
             See :py:func:`numpy.quantile` or [1]_ for details. The "method" argument
             was previously called "interpolation", renamed in accordance with numpy
             version 1.22.0.
-
-            (*) These methods require numpy version 1.22 or newer.
 
         keep_attrs : bool, optional
             If True, the dataset's attributes (`attrs`) will be copied from
@@ -8435,8 +9214,52 @@ class Dataset(
         -------
         result : Dataset
 
+        Examples
+        --------
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "math_scores": (
+        ...             ["student", "test"],
+        ...             [[90, 85, 79], [78, 80, 85], [95, 92, 98]],
+        ...         ),
+        ...         "english_scores": (
+        ...             ["student", "test"],
+        ...             [[88, 90, 92], [75, 82, 79], [39, 96, 78]],
+        ...         ),
+        ...     },
+        ...     coords={
+        ...         "student": ["Alice", "Bob", "Charlie"],
+        ...         "test": ["Test 1", "Test 2", "Test 3"],
+        ...     },
+        ... )
+
+        # Indices of the minimum values along the 'student' dimension are calculated
+
+        >>> argmin_indices = dataset.argmin(dim="student")
+
+        >>> min_score_in_math = dataset["student"].isel(
+        ...     student=argmin_indices["math_scores"]
+        ... )
+        >>> min_score_in_math
+        <xarray.DataArray 'student' (test: 3)>
+        array(['Bob', 'Bob', 'Alice'], dtype='<U7')
+        Coordinates:
+            student  (test) <U7 'Bob' 'Bob' 'Alice'
+          * test     (test) <U6 'Test 1' 'Test 2' 'Test 3'
+
+        >>> min_score_in_english = dataset["student"].isel(
+        ...     student=argmin_indices["english_scores"]
+        ... )
+        >>> min_score_in_english
+        <xarray.DataArray 'student' (test: 3)>
+        array(['Charlie', 'Bob', 'Charlie'], dtype='<U7')
+        Coordinates:
+            student  (test) <U7 'Charlie' 'Bob' 'Charlie'
+          * test     (test) <U6 'Test 1' 'Test 2' 'Test 3'
+
         See Also
         --------
+        Dataset.idxmin
         DataArray.argmin
         """
         if dim is None:
@@ -8493,6 +9316,39 @@ class Dataset(
         Returns
         -------
         result : Dataset
+
+        Examples
+        --------
+
+        >>> dataset = xr.Dataset(
+        ...     {
+        ...         "math_scores": (
+        ...             ["student", "test"],
+        ...             [[90, 85, 92], [78, 80, 85], [95, 92, 98]],
+        ...         ),
+        ...         "english_scores": (
+        ...             ["student", "test"],
+        ...             [[88, 90, 92], [75, 82, 79], [93, 96, 91]],
+        ...         ),
+        ...     },
+        ...     coords={
+        ...         "student": ["Alice", "Bob", "Charlie"],
+        ...         "test": ["Test 1", "Test 2", "Test 3"],
+        ...     },
+        ... )
+
+        # Indices of the maximum values along the 'student' dimension are calculated
+
+        >>> argmax_indices = dataset.argmax(dim="test")
+
+        >>> argmax_indices
+        <xarray.Dataset>
+        Dimensions:         (student: 3)
+        Coordinates:
+          * student         (student) <U7 'Alice' 'Bob' 'Charlie'
+        Data variables:
+            math_scores     (student) int64 2 2 2
+            english_scores  (student) int64 2 1 1
 
         See Also
         --------
@@ -8631,6 +9487,7 @@ class Dataset(
         p0: dict[str, float | DataArray] | None = None,
         bounds: dict[str, tuple[float | DataArray, float | DataArray]] | None = None,
         param_names: Sequence[str] | None = None,
+        errors: ErrorOptions = "raise",
         kwargs: dict[str, Any] | None = None,
     ) -> T_Dataset:
         """
@@ -8675,6 +9532,10 @@ class Dataset(
             this will be automatically determined by arguments of `func`. `param_names`
             should be manually supplied when fitting a function that takes a variable
             number of parameters.
+        errors : {"raise", "ignore"}, default: "raise"
+            If 'raise', any errors from the `scipy.optimize_curve_fit` optimization will
+            raise an exception. If 'ignore', the coefficients and covariances for the
+            coordinates where the fitting failed will be NaN.
         **kwargs : optional
             Additional keyword arguments to passed to scipy curve_fit.
 
@@ -8757,6 +9618,9 @@ class Dataset(
                             f"dimensions {preserved_dims}."
                         )
 
+        if errors not in ["raise", "ignore"]:
+            raise ValueError('errors must be either "raise" or "ignore"')
+
         # Broadcast all coords with each other
         coords_ = broadcast(*coords_)
         coords_ = [
@@ -8793,7 +9657,15 @@ class Dataset(
                     pcov = np.full([n_params, n_params], np.nan)
                     return popt, pcov
             x = np.squeeze(x)
-            popt, pcov = curve_fit(func, x, y, p0=p0_, bounds=(lb, ub), **kwargs)
+
+            try:
+                popt, pcov = curve_fit(func, x, y, p0=p0_, bounds=(lb, ub), **kwargs)
+            except RuntimeError:
+                if errors == "raise":
+                    raise
+                popt = np.full([n_params], np.nan)
+                pcov = np.full([n_params, n_params], np.nan)
+
             return popt, pcov
 
         result = type(self)()

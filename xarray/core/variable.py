@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, NoReturn
 import numpy as np
 import pandas as pd
 from numpy.typing import ArrayLike
-from packaging.version import Version
 
 import xarray as xr  # only for Dataset and DataArray
 from xarray.core import common, dtypes, duck_array_ops, indexing, nputils, ops, utils
@@ -125,17 +124,15 @@ def as_variable(obj, name=None) -> Variable | IndexVariable:
     elif isinstance(obj, tuple):
         if isinstance(obj[1], DataArray):
             raise TypeError(
-                "Using a DataArray object to construct a variable is"
+                f"Variable {name!r}: Using a DataArray object to construct a variable is"
                 " ambiguous, please extract the data using the .data property."
             )
         try:
             obj = Variable(*obj)
         except (TypeError, ValueError) as error:
-            # use .format() instead of % because it handles tuples consistently
             raise error.__class__(
-                "Could not convert tuple of form "
-                "(dims, data[, attrs, encoding]): "
-                "{} to Variable.".format(obj)
+                f"Variable {name!r}: Could not convert tuple of form "
+                f"(dims, data[, attrs, encoding]): {obj} to Variable."
             )
     elif utils.is_scalar(obj):
         obj = Variable([], obj)
@@ -154,18 +151,12 @@ def as_variable(obj, name=None) -> Variable | IndexVariable:
         obj = Variable(name, data, fastpath=True)
     else:
         raise TypeError(
-            "unable to convert object into a variable without an "
+            f"Variable {name!r}: unable to convert object into a variable without an "
             f"explicit list of dimensions: {obj!r}"
         )
 
-    if name is not None and name in obj.dims:
-        # convert the Variable into an Index
-        if obj.ndim != 1:
-            raise MissingDimensionsError(
-                f"{name!r} has more than 1-dimension and the same name as one of its "
-                f"dimensions {obj.dims!r}. xarray disallows such variables because they "
-                "conflict with the coordinates used to label dimensions."
-            )
+    if name is not None and name in obj.dims and obj.ndim == 1:
+        # automatically convert the Variable into an Index
         obj = obj.to_index_variable()
 
     return obj
@@ -1085,9 +1076,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
             ndata = as_compatible_data(data)
             if self.shape != ndata.shape:
                 raise ValueError(
-                    "Data shape {} must match shape of object {}".format(
-                        ndata.shape, self.shape
-                    )
+                    f"Data shape {ndata.shape} must match shape of object {self.shape}"
                 )
 
         attrs = copy.deepcopy(self._attrs, memo) if deep else copy.copy(self._attrs)
@@ -2208,15 +2197,15 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
             desired quantile lies between two data points. The options sorted by their R
             type as summarized in the H&F paper [1]_ are:
 
-                1. "inverted_cdf" (*)
-                2. "averaged_inverted_cdf" (*)
-                3. "closest_observation" (*)
-                4. "interpolated_inverted_cdf" (*)
-                5. "hazen" (*)
-                6. "weibull" (*)
+                1. "inverted_cdf"
+                2. "averaged_inverted_cdf"
+                3. "closest_observation"
+                4. "interpolated_inverted_cdf"
+                5. "hazen"
+                6. "weibull"
                 7. "linear"  (default)
-                8. "median_unbiased" (*)
-                9. "normal_unbiased" (*)
+                8. "median_unbiased"
+                9. "normal_unbiased"
 
             The first three methods are discontiuous.  The following discontinuous
             variations of the default "linear" (7.) option are also available:
@@ -2229,8 +2218,6 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
             See :py:func:`numpy.quantile` or [1]_ for details. The "method" argument
             was previously called "interpolation", renamed in accordance with numpy
             version 1.22.0.
-
-            (*) These methods require numpy version 1.22 or newer.
 
         keep_attrs : bool, optional
             If True, the variable's attributes (`attrs`) will be copied from
@@ -2299,14 +2286,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
 
         axis = np.arange(-1, -1 * len(dim) - 1, -1)
 
-        if Version(np.__version__) >= Version("1.22.0"):
-            kwargs = {"q": q, "axis": axis, "method": method}
-        else:
-            if method not in ("linear", "lower", "higher", "midpoint", "nearest"):
-                raise ValueError(
-                    f"Interpolation method '{method}' requires numpy >= 1.22 or is not supported."
-                )
-            kwargs = {"q": q, "axis": axis, "interpolation": method}
+        kwargs = {"q": q, "axis": axis, "method": method}
 
         result = apply_ufunc(
             _wrapper,
@@ -2484,7 +2464,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
                 pads[d] = (win - 1, 0)
 
         padded = var.pad(pads, mode="constant", constant_values=fill_value)
-        axis = [self.get_axis_num(d) for d in dim]
+        axis = tuple(self.get_axis_num(d) for d in dim)
         new_dims = self.dims + tuple(window_dim)
         return Variable(
             new_dims,
@@ -3046,9 +3026,7 @@ class IndexVariable(Variable):
             ndata = as_compatible_data(data)
             if self.shape != ndata.shape:
                 raise ValueError(
-                    "Data shape {} must match shape of object {}".format(
-                        ndata.shape, self.shape
-                    )
+                    f"Data shape {ndata.shape} must match shape of object {self.shape}"
                 )
 
         attrs = copy.deepcopy(self._attrs) if deep else copy.copy(self._attrs)
@@ -3136,10 +3114,6 @@ class IndexVariable(Variable):
         raise TypeError(
             "Values of an IndexVariable are immutable and can not be modified inplace"
         )
-
-
-# for backwards compatibility
-Coordinate = utils.alias(IndexVariable, "Coordinate")
 
 
 def _unified_dims(variables):

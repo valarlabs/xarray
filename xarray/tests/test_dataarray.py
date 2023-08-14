@@ -27,6 +27,7 @@ from xarray.coding.times import CFDatetimeCoder
 from xarray.convert import from_cdms2
 from xarray.core import dtypes
 from xarray.core.common import full_like
+from xarray.core.coordinates import Coordinates
 from xarray.core.indexes import Index, PandasIndex, filter_indexes_from_coords
 from xarray.core.types import QueryEngineOptions, QueryParserOptions
 from xarray.core.utils import is_scalar
@@ -485,6 +486,32 @@ class TestDataArray:
         ecoord = np.arange(8)
         expected = DataArray(data, coords={"x": ecoord, "y": ecoord}, dims=["x", "y"])
         assert_equal(actual, expected)
+
+    def test_constructor_no_default_index(self) -> None:
+        # explicitly passing a Coordinates object skips the creation of default index
+        da = DataArray(range(3), coords=Coordinates({"x": ("x", [1, 2, 3])}))
+        assert "x" in da.coords
+        assert "x" not in da.xindexes
+
+    def test_constructor_multiindex(self) -> None:
+        midx = pd.MultiIndex.from_product([["a", "b"], [1, 2]], names=("one", "two"))
+        coords = Coordinates.from_pandas_multiindex(midx, "x")
+
+        da = DataArray(range(4), coords=coords, dims="x")
+        assert_identical(da.coords, coords)
+
+    def test_constructor_custom_index(self) -> None:
+        class CustomIndex(Index):
+            ...
+
+        coords = Coordinates(
+            coords={"x": ("x", [1, 2, 3])}, indexes={"x": CustomIndex()}
+        )
+        da = DataArray(range(3), coords=coords)
+        assert isinstance(da.xindexes["x"], CustomIndex)
+
+        # test coordinate variables copied
+        assert da.coords["x"] is not coords.variables["x"]
 
     def test_equals_and_identical(self) -> None:
         orig = DataArray(np.arange(5.0), {"a": 42}, dims="x")
@@ -1546,6 +1573,24 @@ class TestDataArray:
         with pytest.warns(FutureWarning, match=r"Updating MultiIndexed coordinate"):
             data.assign_coords(x=range(4))
 
+    def test_assign_coords_custom_index(self) -> None:
+        class CustomIndex(Index):
+            pass
+
+        coords = Coordinates(
+            coords={"x": ("x", [1, 2, 3])}, indexes={"x": CustomIndex()}
+        )
+        da = xr.DataArray([0, 1, 2], dims="x")
+        actual = da.assign_coords(coords)
+        assert isinstance(actual.xindexes["x"], CustomIndex)
+
+    def test_assign_coords_no_default_index(self) -> None:
+        coords = Coordinates({"y": ("y", [1, 2, 3])})
+        da = DataArray([1, 2, 3], dims="y")
+        actual = da.assign_coords(coords)
+        assert_identical(actual.coords, coords, check_default_indexes=False)
+        assert "y" not in actual.xindexes
+
     def test_coords_alignment(self) -> None:
         lhs = DataArray([1, 2, 3], [("x", [0, 1, 2])])
         rhs = DataArray([2, 3, 4], [("x", [1, 2, 3])])
@@ -1697,6 +1742,19 @@ class TestDataArray:
 
         assert_identical(expected, actual)
         assert actual.dtype == expected.dtype
+
+    def test_reindex_empty_array_dtype(self) -> None:
+        # Dtype of reindex result should match dtype of the original DataArray.
+        # See GH issue #7299
+        x = xr.DataArray([], dims=("x",), coords={"x": []}).astype("float32")
+        y = x.reindex(x=[1.0, 2.0])
+
+        assert (
+            x.dtype == y.dtype
+        ), "Dtype of reindexed DataArray should match dtype of the original DataArray"
+        assert (
+            y.dtype == np.float32
+        ), "Dtype of reindexed DataArray should remain float32"
 
     def test_rename(self) -> None:
         da = xr.DataArray(
@@ -2790,10 +2848,7 @@ class TestDataArray:
         q = [0.25, 0.5, 0.75]
         actual = DataArray(self.va).quantile(q, method=method)
 
-        if Version(np.__version__) >= Version("1.22.0"):
-            expected = np.nanquantile(self.dv.values, np.array(q), method=method)
-        else:
-            expected = np.nanquantile(self.dv.values, np.array(q), interpolation=method)
+        expected = np.nanquantile(self.dv.values, np.array(q), method=method)
 
         np.testing.assert_allclose(actual.values, expected)
 
@@ -4570,6 +4625,48 @@ class TestDataArray:
                 func=sine,
                 bounds={"a": (0, DataArray([1], coords={"foo": [1]}))},
             )
+
+    @requires_scipy
+    @pytest.mark.parametrize("use_dask", [True, False])
+    def test_curvefit_ignore_errors(self, use_dask: bool) -> None:
+        if use_dask and not has_dask:
+            pytest.skip("requires dask")
+
+        # nonsense function to make the optimization fail
+        def line(x, a, b):
+            if a > 10:
+                return 0
+            return a * x + b
+
+        da = DataArray(
+            [[1, 3, 5], [0, 20, 40]],
+            coords={"i": [1, 2], "x": [0.0, 1.0, 2.0]},
+        )
+
+        if use_dask:
+            da = da.chunk({"i": 1})
+
+        expected = DataArray(
+            [[2, 1], [np.nan, np.nan]], coords={"i": [1, 2], "param": ["a", "b"]}
+        )
+
+        with pytest.raises(RuntimeError, match="calls to function has reached maxfev"):
+            da.curvefit(
+                coords="x",
+                func=line,
+                # limit maximum number of calls so the optimization fails
+                kwargs=dict(maxfev=5),
+            ).compute()  # have to compute to raise the error
+
+        fit = da.curvefit(
+            coords="x",
+            func=line,
+            errors="ignore",
+            # limit maximum number of calls so the optimization fails
+            kwargs=dict(maxfev=5),
+        ).compute()
+
+        assert_allclose(fit.curvefit_coefficients, expected)
 
 
 class TestReduce:

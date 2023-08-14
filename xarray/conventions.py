@@ -108,6 +108,10 @@ def ensure_dtype_not_object(var: Variable, name: T_Name = None) -> Variable:
     if var.dtype.kind == "O":
         dims, data, attrs, encoding = _var_as_tuple(var)
 
+        # leave vlen dtypes unchanged
+        if strings.check_vlen_dtype(data.dtype) is not None:
+            return var
+
         if is_duck_dask_array(data):
             warnings.warn(
                 "variable {} has data in the form of a dask array with "
@@ -690,7 +694,7 @@ def _encode_coordinates(variables, attributes, non_dim_coord_names):
         if not coords_str and variable_coordinates[name]:
             coordinates_text = " ".join(
                 str(coord_name)
-                for coord_name in variable_coordinates[name]
+                for coord_name in sorted(variable_coordinates[name])
                 if coord_name not in not_technically_coordinates
             )
             if coordinates_text:
@@ -715,7 +719,7 @@ def _encode_coordinates(variables, attributes, non_dim_coord_names):
                 SerializationWarning,
             )
         else:
-            attributes["coordinates"] = " ".join(map(str, global_coordinates))
+            attributes["coordinates"] = " ".join(sorted(map(str, global_coordinates)))
 
     return variables, attributes
 

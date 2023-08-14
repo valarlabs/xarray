@@ -16,6 +16,7 @@ import warnings
 from collections.abc import Iterator
 from contextlib import ExitStack
 from io import BytesIO
+from os import listdir
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 
@@ -46,6 +47,7 @@ from xarray.backends.netCDF4_ import (
 )
 from xarray.backends.pydap_ import PydapDataStore
 from xarray.backends.scipy_ import ScipyBackendEntrypoint
+from xarray.coding.strings import check_vlen_dtype, create_vlen_dtype
 from xarray.coding.variables import SerializationWarning
 from xarray.conventions import encode_dataset_coordinates
 from xarray.core import indexing
@@ -859,6 +861,20 @@ class CFEncodedBase(DatasetIOBase):
             with self.roundtrip(original) as actual:
                 assert_identical(expected, actual)
 
+    def test_roundtrip_empty_vlen_string_array(self) -> None:
+        # checks preserving vlen dtype for empty arrays GH7862
+        dtype = create_vlen_dtype(str)
+        original = Dataset({"a": np.array([], dtype=dtype)})
+        assert check_vlen_dtype(original["a"].dtype) == str
+        with self.roundtrip(original) as actual:
+            assert_identical(original, actual)
+            assert object == actual["a"].dtype
+            assert actual["a"].dtype == original["a"].dtype
+            # only check metadata for capable backends
+            # eg. NETCDF3 based backends do not roundtrip metadata
+            if actual["a"].dtype.metadata is not None:
+                assert check_vlen_dtype(actual["a"].dtype) == str
+
     @pytest.mark.parametrize(
         "decoded_fn, encoded_fn",
         [
@@ -1596,6 +1612,20 @@ class NetCDF4Base(NetCDFBase):
             assert actual.encoding["unlimited_dims"] == set("y")
             assert_equal(ds, actual)
 
+    def test_raise_on_forward_slashes_in_names(self) -> None:
+        # test for forward slash in variable names and dimensions
+        # see GH 7943
+        data_vars: list[dict[str, Any]] = [
+            {"PASS/FAIL": (["PASSFAIL"], np.array([0]))},
+            {"PASS/FAIL": np.array([0])},
+            {"PASSFAIL": (["PASS/FAIL"], np.array([0]))},
+        ]
+        for dv in data_vars:
+            ds = Dataset(data_vars=dv)
+            with pytest.raises(ValueError, match="Forward slashes '/' are not allowed"):
+                with self.roundtrip(ds):
+                    pass
+
 
 @requires_netCDF4
 class TestNetCDF4Data(NetCDF4Base):
@@ -1834,6 +1864,8 @@ class ZarrBase(CFEncodedBase):
         with self.create_zarr_target() as store_target, self.create_zarr_target() as chunk_store:
             save_kwargs = {"chunk_store": chunk_store}
             self.save(expected, store_target, **save_kwargs)
+            # the chunk store must have been populated with some entries
+            assert len(chunk_store) > 0
             open_kwargs = {"backend_kwargs": {"chunk_store": chunk_store}}
             with self.open(store_target, **open_kwargs) as ds:
                 assert_equal(ds, expected)
@@ -2632,6 +2664,86 @@ class TestZarrDirectoryStore(ZarrBase):
                 # verify that a v2 store was created
                 assert group.zarr_group.store._store_version == 2
             yield group
+
+
+@requires_zarr
+class TestZarrWriteEmpty(TestZarrDirectoryStore):
+    @contextlib.contextmanager
+    def temp_dir(self) -> Iterator[tuple[str, str]]:
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "test.zarr")
+            yield d, store
+
+    @contextlib.contextmanager
+    def roundtrip_dir(
+        self,
+        data,
+        store,
+        save_kwargs=None,
+        open_kwargs=None,
+        allow_cleanup_failure=False,
+    ) -> Iterator[Dataset]:
+        if save_kwargs is None:
+            save_kwargs = {}
+        if open_kwargs is None:
+            open_kwargs = {}
+
+        data.to_zarr(store, **save_kwargs, **self.version_kwargs)
+        with xr.open_dataset(
+            store, engine="zarr", **open_kwargs, **self.version_kwargs
+        ) as ds:
+            yield ds
+
+    @pytest.mark.parametrize("write_empty", [True, False])
+    def test_write_empty(self, write_empty: bool) -> None:
+        if not write_empty:
+            expected = ["0.1.0", "1.1.0"]
+        else:
+            expected = [
+                "0.0.0",
+                "0.0.1",
+                "0.1.0",
+                "0.1.1",
+                "1.0.0",
+                "1.0.1",
+                "1.1.0",
+                "1.1.1",
+            ]
+
+        ds = xr.Dataset(
+            data_vars={
+                "test": (
+                    ("Z", "Y", "X"),
+                    np.array([np.nan, np.nan, 1.0, np.nan]).reshape((1, 2, 2)),
+                )
+            }
+        )
+
+        if has_dask:
+            ds["test"] = ds["test"].chunk((1, 1, 1))
+            encoding = None
+        else:
+            encoding = {"test": {"chunks": (1, 1, 1)}}
+
+        with self.temp_dir() as (d, store):
+            ds.to_zarr(
+                store,
+                mode="w",
+                encoding=encoding,
+                write_empty_chunks=write_empty,
+            )
+
+            with self.roundtrip_dir(
+                ds,
+                store,
+                {"mode": "a", "append_dim": "Z", "write_empty_chunks": write_empty},
+            ) as a_ds:
+                expected_ds = xr.concat([ds, ds], dim="Z")
+
+                assert_identical(a_ds, expected_ds)
+
+                ls = listdir(os.path.join(store, "test"))
+                assert set(expected) == set([file for file in ls if file[0] != "."])
 
 
 class ZarrBaseV3(ZarrBase):
