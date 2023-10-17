@@ -6770,6 +6770,7 @@ class Dataset(
         func: Callable,
         keep_attrs: bool | None = None,
         args: Iterable[Any] = (),
+        progress=False,
         **kwargs: Any,
     ) -> T_Dataset:
         """Apply a function to each data variable in this dataset
@@ -6815,9 +6816,11 @@ class Dataset(
         """
         if keep_attrs is None:
             keep_attrs = _get_keep_attrs(default=False)
+            
+        from tqdm import tqdm
         variables = {
             k: maybe_wrap_array(v, func(v, *args, **kwargs))
-            for k, v in self.data_vars.items()
+            for k, v in tqdm(self.data_vars.items(), disable=not progress)
         }
         if keep_attrs:
             for k, v in variables.items():
