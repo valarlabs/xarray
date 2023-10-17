@@ -16,6 +16,7 @@ from typing import (
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from xarray.core import dtypes, duck_array_ops, nputils, ops
 from xarray.core._aggregations import (
@@ -1519,6 +1520,7 @@ class DatasetGroupByBase(GroupBy["Dataset"], DatasetGroupbyArithmetic):
         func: Callable[..., Dataset],
         args: tuple[Any, ...] = (),
         shortcut: bool | None = None,
+        progress=False,
         **kwargs: Any,
     ) -> Dataset:
         """Apply a function to each Dataset in the group and concatenate them
@@ -1551,7 +1553,10 @@ class DatasetGroupByBase(GroupBy["Dataset"], DatasetGroupbyArithmetic):
             The result of splitting, applying and combining this dataset.
         """
         # ignore shortcut if set (for now)
-        applied = (func(ds, *args, **kwargs) for ds in self._iter_grouped())
+        applied = (
+            func(ds, *args, **kwargs)
+            for ds in tqdm(self._iter_grouped(), disable=not progress)
+        )
         return self._combine(applied)
 
     def apply(self, func, args=(), shortcut=None, **kwargs):
