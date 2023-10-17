@@ -1555,7 +1555,7 @@ class DatasetGroupByBase(GroupBy["Dataset"], DatasetGroupbyArithmetic):
         # ignore shortcut if set (for now)
         applied = (
             func(ds, *args, **kwargs)
-            for ds in tqdm(self._iter_grouped(), disable=not progress)
+            for ds in tqdm(self._iter_grouped(), disable=not progress, total=len(self))
         )
         return self._combine(applied)
 
