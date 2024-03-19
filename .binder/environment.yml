@@ -3,7 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - python=3.9
-  - boto3
+  - boto3=1.34.653
   - bottleneck
   - cartopy
   - cdms2
@@ -17,7 +17,7 @@ dependencies:
   - h5py
   - hdf5
   - iris
-  - lxml    # Optional dep of pydap
+  - lxml # Optional dep of pydap
   - matplotlib
   - nc-time-axis
   - netcdf4
@@ -39,4 +39,4 @@ dependencies:
   - xarray
   - zarr
   - pip:
-    - numbagg
+      - numbagg

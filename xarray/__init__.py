@@ -15,24 +15,12 @@ from xarray.conventions import SerializationWarning, decode_cf
 from xarray.core.alignment import align, broadcast
 from xarray.core.combine import combine_by_coords, combine_nested
 from xarray.core.common import ALL_DIMS, full_like, ones_like, zeros_like
-from xarray.core.computation import (
-    apply_ufunc,
-    corr,
-    cov,
-    cross,
-    dot,
-    polyval,
-    unify_chunks,
-    where,
-)
+from xarray.core.computation import apply_ufunc, corr, cov, cross, dot, polyval, unify_chunks, where
 from xarray.core.concat import concat
 from xarray.core.coordinates import Coordinates
 from xarray.core.dataarray import DataArray
 from xarray.core.dataset import Dataset
-from xarray.core.extensions import (
-    register_dataarray_accessor,
-    register_dataset_accessor,
-)
+from xarray.core.extensions import register_dataarray_accessor, register_dataset_accessor
 from xarray.core.indexes import Index
 from xarray.core.indexing import IndexSelResult
 from xarray.core.merge import Context, MergeError, merge
@@ -47,12 +35,9 @@ except ImportError:
     # if the fallback library is missing, we are doomed.
     from importlib_metadata import version as _version
 
-try:
-    __version__ = _version("xarray")
-except Exception:
-    # Local copy or not installed with setuptools.
-    # Disable minimum version checks on downstream libraries.
-    __version__ = "999"
+# Local copy or not installed with setuptools.
+# Disable minimum version checks on downstream libraries.
+__version__ = "2023.05.0"
 
 # A hardcoded __all__ variable is necessary to appease
 # `mypy --strict` running in projects that import xarray.
